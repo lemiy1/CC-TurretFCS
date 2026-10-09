@@ -1,0 +1,35 @@
+local repo = "https://raw.githubusercontent.com/lemiy1/CC-TurretFCS/"
+
+local files = {
+  "main",
+  "config",
+  "intercept_solver",
+  "math_utils_v6",
+  "predictor",
+  "target_tracker",
+  "1CANaim",
+  "2DIRcannon",
+  "3names",
+  "4zones",
+  "5auto_calibrate",
+}
+
+for _, name in ipairs(files) do
+  print("Downloading " .. name)
+
+  local response, err = http.get(repo .. name)
+  if not response then
+    printError("Failed: " .. name .. " (" .. tostring(err) .. ")")
+  else
+    local content = response.readAll()
+    response.close()
+
+    local file = fs.open(name, "w")
+    file.write(content)
+    file.close()
+
+    print("Saved " .. name)
+  end
+end
+
+print("All files installed.")
