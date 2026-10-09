@@ -1,4 +1,4 @@
-local repo = "https://raw.githubusercontent.com/lemiy1/CC-TurretFCS/"
+local repo = "https://raw.githubusercontent.com/lemiy1/CC-TurretFCS/main/"
 
 local files = {
   "main",
