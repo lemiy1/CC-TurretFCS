@@ -1,0 +1,264 @@
+-- target_tracker.lua
+-- Player sample validation, per-player history and velocity estimation.
+-- Pure data processing: no peripheral calls, no yields.
+-- Units: positions in blocks (world frame), time in seconds (os.clock),
+--        velocity in blocks/second.
+
+local u    = require("math_utils_v6")
+local vec3 = u.Vector3
+
+local M = {}
+
+local function finite(x)
+    return type(x) == "number" and x == x and x > -1e9 and x < 1e9
+end
+
+-- TRACK (one per player name)
+
+local Track = {}
+Track.__index = Track
+
+local function newTrack(name, cfg)
+    return setmetatable({
+        name       = name,
+        cfg        = cfg,
+        hist       = {},
+        dim        = nil,
+        epoch      = 0,      -- incremented whenever the history is wiped
+        seq        = 0,      -- incremented for every accepted sample
+        int_run    = 0,      -- consecutive samples with all-integer coordinates
+        last_dt    = nil,
+        status     = "no data yet",
+        reset_note = nil,
+    }, Track)
+end
+
+function Track:reset(reason)
+    self.hist       = {}
+    self.epoch      = self.epoch + 1
+    self.int_run    = 0
+    self.last_dt    = nil
+    self.reset_note = reason
+end
+
+-- raw: table returned by detector.getPlayer (or nil); err: error text if the call failed
+function Track:push(raw, now, required_dim, err)
+    local cfg = self.cfg
+
+    if err then
+        self.status = "detector error: " .. tostring(err)
+        return false
+    end
+    if type(raw) ~= "table" then
+        self.status = "player not found (nil)"
+        return false
+    end
+
+    local x, y, z = raw.x, raw.y, raw.z
+    if not (finite(x) and finite(y) and finite(z)) then
+        self.status = "invalid coordinates"
+        return false
+    end
+
+    -- dimension handling
+    local dim = raw.dimension
+    if required_dim then
+        if dim ~= required_dim then
+            if #self.hist > 0 then self:reset("dimension changed") end
+            self.dim    = dim
+            self.status = "wrong dimension: " .. tostring(dim)
+            return false
+        end
+    else
+        if type(dim) ~= "string" then dim = "?" end
+        if self.dim ~= nil and self.dim ~= dim and #self.hist > 0 then
+            self:reset("dimension changed")
+        end
+    end
+    self.dim = dim
+
+    local off = cfg.pos_offset or {}
+    local px  = x + (off.x or 0)
+    local py  = y + (off.y or 0)
+    local pz  = z + (off.z or 0)
+
+    -- continuity checks against the previous sample
+    local dt_s = nil
+    local n    = #self.hist
+    if n > 0 then
+        local last = self.hist[n]
+        local dt   = now - last.t
+        if dt < 0 then
+            self:reset("clock went backwards")
+        elseif dt <= 1e-6 then
+            -- same tick: nothing new
+            self.status = "ok"
+            return true
+        elseif dt > cfg.history_gap_s then
+            self:reset(string.format("gap %.1fs", dt))
+        else
+            local dx, dy, dz = px - last.x, py - last.y, pz - last.z
+            local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist > cfg.max_speed * dt + cfg.teleport_slack then
+                self:reset(string.format("jump %.0f blocks", dist))
+            else
+                dt_s = dt
+            end
+        end
+    end
+    self.last_dt = dt_s
+
+    local is_int = (x == math.floor(x)) and (y == math.floor(y)) and (z == math.floor(z))
+    self.int_run = is_int and (self.int_run + 1) or 0
+
+    local h = self.hist
+    h[#h + 1] = { t = now, x = px, y = py, z = pz }
+    self.seq    = self.seq + 1
+    self.status = "ok"
+
+    -- keep only the velocity window (but at least 2 samples)
+    local cutoff = now - cfg.velocity_window_s
+    while #h > 2 and h[1].t < cutoff do table.remove(h, 1) end
+    while #h > 200 do table.remove(h, 1) end
+
+    return true
+end
+
+-- Returns an estimate table, or nil + reason.
+function Track:estimate(now)
+    local cfg = self.cfg
+    local h   = self.hist
+    local n   = #h
+    if n == 0 then return nil, self.status end
+
+    local last = h[n]
+    local age  = now - last.t
+    if age > cfg.stale_s then
+        if self.status ~= "ok" then
+            return nil, string.format("%s (last data %.1fs ago)", self.status, age)
+        end
+        return nil, string.format("data stale (%.2fs)", age)
+    end
+
+    if n < cfg.min_samples then
+        return nil, string.format("warming up: %d/%d samples", n, cfg.min_samples)
+    end
+    local span = last.t - h[1].t
+    if span < cfg.min_span_s then
+        return nil, string.format("warming up: span %.2f/%.2fs", span, cfg.min_span_s)
+    end
+
+    -- least-squares slope of position over time (blocks / second)
+    local tm, xm, ym, zm = 0, 0, 0, 0
+    for i = 1, n do
+        tm = tm + h[i].t
+        xm = xm + h[i].x
+        ym = ym + h[i].y
+        zm = zm + h[i].z
+    end
+    tm, xm, ym, zm = tm / n, xm / n, ym / n, zm / n
+
+    local sxx, sx, sy, sz = 0, 0, 0, 0
+    for i = 1, n do
+        local d = h[i].t - tm
+        sxx = sxx + d * d
+        sx  = sx + d * (h[i].x - xm)
+        sy  = sy + d * (h[i].y - ym)
+        sz  = sz + d * (h[i].z - zm)
+    end
+    if sxx < 1e-9 then return nil, "degenerate time spread" end
+
+    local vx, vy, vz = sx / sxx, sy / sxx, sz / sxx
+    local speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+    if speed > cfg.max_speed then
+        return nil, string.format("speed %.0f b/s above max_speed", speed)
+    end
+
+    local px, py, pz = last.x, last.y, last.z
+    if cfg.use_fitted_pos then
+        local k = last.t - tm
+        px, py, pz = xm + vx * k, ym + vy * k, zm + vz * k
+    end
+
+    return {
+        name        = self.name,
+        pos         = vec3.new(px, py, pz),     -- world frame, blocks
+        velo        = vec3.new(vx, vy, vz),     -- world frame, blocks / second
+        read_time   = last.t,                   -- os.clock() seconds
+        age         = age,
+        speed       = speed,
+        n           = n,
+        span        = span,
+        seq         = self.seq,
+        epoch       = self.epoch,
+        dim         = self.dim,
+        all_integer = self.int_run >= 8,
+    }
+end
+
+-- MANAGER (target list + selection)
+
+local Manager = {}
+Manager.__index = Manager
+
+function M.new(cfg, names, cannon_world, required_dim)
+    local self = setmetatable({}, Manager)
+    self.cfg          = cfg
+    self.names        = names
+    self.cannon       = cannon_world       -- Vector3 (may be nil: select() must not be called then)
+    self.required_dim = required_dim
+    self.tracks       = {}
+    self.reasons      = {}
+    self.current      = nil
+    for _, name in ipairs(names) do
+        self.tracks[name] = newTrack(name, cfg)
+    end
+    return self
+end
+
+function Manager:ingest(name, raw, now, err)
+    local tr = self.tracks[name]
+    if tr then return tr:push(raw, now, self.required_dim, err) end
+    return false
+end
+
+-- Picks the nearest valid target (with hysteresis). Returns estimate or nil + reason.
+function Manager:select(now)
+    local cfg   = self.cfg
+    local cands = {}
+
+    for _, name in ipairs(self.names) do
+        local est, why = self.tracks[name]:estimate(now)
+        if est then
+            local d = (est.pos - self.cannon):length()
+            est.dist = d
+            if d < cfg.min_range then
+                why = string.format("too close (%.1f)", d)
+            elseif d > cfg.max_range then
+                why = string.format("out of range (%.0f)", d)
+            else
+                cands[#cands + 1] = est
+            end
+        end
+        self.reasons[name] = why or "ok"
+    end
+
+    local pick, cur = nil, nil
+    for _, e in ipairs(cands) do
+        if not pick or e.dist < pick.dist then pick = e end
+        if e.name == self.current then cur = e end
+    end
+    if pick and cur and pick ~= cur and pick.dist > cur.dist - cfg.switch_margin then
+        pick = cur
+    end
+
+    self.current = pick and pick.name or nil
+    if pick then return pick, "ok" end
+
+    if #self.names == 1 then
+        return nil, tostring(self.reasons[self.names[1]])
+    end
+    return nil, "no valid target in list (" .. #self.names .. " names)"
+end
+
+return M

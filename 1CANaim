@@ -1,0 +1,114 @@
+-- set_aim.lua
+-- Edit barrel length and yaw/pitch offsets in config.lua.
+
+local scriptPath = shell.getRunningProgram()
+local scriptDir = fs.getDir(scriptPath)
+local CONFIG_FILE = fs.combine(scriptDir, "config")
+
+local function readFile(path)
+    if not fs.exists(path) then
+        error("File not found: " .. path)
+    end
+
+    local file = fs.open(path, "r")
+    if not file then
+        error("Could not open: " .. path)
+    end
+
+    local text = file.readAll()
+    file.close()
+    return text
+end
+
+local function writeFile(path, text)
+    local file = fs.open(path, "w")
+    if not file then
+        error("Could not write: " .. path)
+    end
+
+    file.write(text)
+    file.close()
+end
+
+local function formatNumber(value)
+    return string.format("%.6f", value):gsub("0+$", ""):gsub("%.$", "")
+end
+
+local function askNumber(label, oldValue)
+    while true do
+        write(label .. " [" .. tostring(oldValue) .. "]: ")
+        local input = read()
+
+        if input == "" then
+            return oldValue
+        end
+
+        local value = tonumber(input)
+        if value then
+            return value
+        end
+
+        print("Enter a number, or press Enter to keep the current value.")
+    end
+end
+
+local function replaceField(text, fieldName, value)
+    local pattern = "(" .. fieldName .. "%s*=%s*)[%+%-]?[%d%.]+"
+
+    local updated, count = text:gsub(pattern, function(prefix)
+        return prefix .. formatNumber(value)
+    end, 1)
+
+    if count ~= 1 then
+        error("Could not find field: " .. fieldName)
+    end
+
+    return updated
+end
+
+local function run()
+    local config = readFile(CONFIG_FILE)
+
+    local oldBarrel = config:match("barrel_len%s*=%s*([%+%-]?[%d%.]+)")
+    local oldYaw = config:match("yaw_offset_deg%s*=%s*([%+%-]?[%d%.]+)")
+    local oldPitch = config:match("pitch_offset_deg%s*=%s*([%+%-]?[%d%.]+)")
+
+    if not oldBarrel then error("Could not find barrel_len.") end
+    if not oldYaw then error("Could not find yaw_offset_deg.") end
+    if not oldPitch then error("Could not find pitch_offset_deg.") end
+
+    print("Press Enter to keep the current value.")
+    print("")
+
+    local barrel = askNumber("Barrel length", tonumber(oldBarrel))
+    if barrel <= 0 then
+        error("Barrel length must be greater than zero.")
+    end
+
+    local yaw = askNumber("Yaw offset (degrees)", tonumber(oldYaw))
+    local pitch = askNumber("Pitch offset (degrees)", tonumber(oldPitch))
+
+    local updated = replaceField(config, "barrel_len", barrel)
+    updated = replaceField(updated, "yaw_offset_deg", yaw)
+    updated = replaceField(updated, "pitch_offset_deg", pitch)
+
+    print("")
+    write("Save changes to " .. CONFIG_FILE .. "? [y/N]: ")
+    local answer = read()
+
+    if answer ~= "y" and answer ~= "Y" then
+        print("Cancelled.")
+        return
+    end
+
+    writeFile(CONFIG_FILE .. ".bak", config)
+    writeFile(CONFIG_FILE, updated)
+
+    print("Saved. Backup: " .. CONFIG_FILE .. ".bak")
+    print("Restart main to apply the changes.")
+end
+
+local ok, err = pcall(run)
+if not ok then
+    print("ERROR: " .. tostring(err))
+end

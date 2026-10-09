@@ -1,0 +1,371 @@
+-- auto_calibrate.lua
+-- Automatic yaw/pitch offset calibration for CC:FCS.
+--
+-- Run: auto_calibrate
+
+local scriptPath = shell.getRunningProgram()
+local scriptDir = fs.getDir(scriptPath)
+local CONFIG_FILE = fs.combine(scriptDir, "config")
+
+local AIM_TIME = 10
+local POINT_DISTANCE = 30
+
+local function readFile(path)
+    if not fs.exists(path) then
+        error("File not found: " .. path)
+    end
+
+    local file = fs.open(path, "r")
+    if not file then
+        error("Could not open: " .. path)
+    end
+
+    local text = file.readAll()
+    file.close()
+    return text
+end
+
+local function writeFile(path, text)
+    local file = fs.open(path, "w")
+    if not file then
+        error("Could not write: " .. path)
+    end
+
+    file.write(text)
+    file.close()
+end
+
+local function nowSeconds()
+    return os.epoch("utc") / 1000
+end
+
+local function formatNumber(value)
+    return string.format("%.6f", value):gsub("0+$", ""):gsub("%.$", "")
+end
+
+local function wrapAngle(angle)
+    angle = angle % 360
+    if angle > 180 then
+        angle = angle - 360
+    end
+    return angle
+end
+
+local function finite(value)
+    return type(value) == "number" and value == value
+        and value > -1e9 and value < 1e9
+end
+
+local function findPeripheral(types, label)
+    for _, peripheralType in ipairs(types) do
+        local device = peripheral.find(peripheralType)
+        if device then
+            return device
+        end
+    end
+
+    error("Could not find " .. label .. ". Tried: "
+        .. table.concat(types, ", "))
+end
+
+local function findRSCs(config)
+    local pitchName = config.peripheral.PITCH_RSC_NAME
+    local yawName = config.peripheral.YAW_RSC_NAME
+
+    if pitchName and yawName then
+        local pitch = peripheral.wrap(pitchName)
+        local yaw = peripheral.wrap(yawName)
+
+        if not pitch then
+            error("Pitch RSC not found: " .. pitchName)
+        end
+        if not yaw then
+            error("Yaw RSC not found: " .. yawName)
+        end
+
+        return pitch, yaw
+    end
+
+    local devices = { peripheral.find(config.peripheral.RSC_TYPE) }
+
+    if #devices ~= 2 then
+        error("Expected 2 RSCs, found " .. #devices .. ".")
+    end
+
+    return devices[config.peripheral.PITCH_RSC_INDEX],
+        devices[config.peripheral.YAW_RSC_INDEX]
+end
+
+local function stopRSCs(pitchRSC, yawRSC)
+    pcall(pitchRSC.setTargetSpeed, 0)
+    pcall(yawRSC.setTargetSpeed, 0)
+end
+
+local function getBlockData(reader)
+    local ok, result = pcall(reader.getBlockData)
+    if not ok then
+        error("Block reader error: " .. tostring(result))
+    end
+
+    if type(result) ~= "table"
+        or not finite(result.CannonPitch)
+        or not finite(result.CannonYaw) then
+        error("Block reader did not return CannonPitch/CannonYaw.")
+    end
+
+    return tonumber(result.CannonPitch), tonumber(result.CannonYaw)
+end
+
+local function getTargetAngles(config, target)
+    local pivot = config.cannon.world_pos
+    local offset = config.target.pos_offset or { x = 0, y = 0, z = 0 }
+
+    local dx = target.x + (offset.x or 0) - pivot.x
+    local dy = target.y + (offset.y or 0) - pivot.y
+    local dz = target.z + (offset.z or 0) - pivot.z
+
+    local horizontal = math.sqrt(dx * dx + dz * dz)
+    if horizontal < 1e-6 then
+        return nil, "Target is directly above or below the pivot."
+    end
+
+    local pitch = math.deg(math.atan(dy / horizontal))
+    local yaw = math.deg(math.atan2(-dx, dz))
+
+    return pitch, yaw
+end
+
+local function commandRSCs(
+    pitchRSC,
+    yawRSC,
+    config,
+    reader,
+    targetPitch,
+    targetYaw
+)
+    local endTime = nowSeconds() + AIM_TIME
+
+    while nowSeconds() < endTime do
+        local ok, cannonPitch, cannonYaw = pcall(getBlockData, reader)
+
+        if ok then
+            local pitchError = targetPitch - cannonPitch
+            local yawError = targetYaw - cannonYaw
+
+            local pitchRPM = (pitchError / config.controller.DT)
+                / 6 * config.controller.RSC_TO_CANNON
+            local yawRPM = (yawError / config.controller.DT)
+                / 6 * config.controller.RSC_TO_CANNON
+
+            pitchRPM = math.max(-config.controller.MAX_RSC_RPM,
+                math.min(config.controller.MAX_RSC_RPM, pitchRPM))
+            yawRPM = math.max(-config.controller.MAX_RSC_RPM,
+                math.min(config.controller.MAX_RSC_RPM, yawRPM))
+
+            local pitchValue = pitchRPM * config.peripheral.PITCH_RSC_SIGN
+            local yawValue = yawRPM * config.peripheral.YAW_RSC_SIGN
+
+            if config.controller.ROUND_RPM then
+                pitchValue = math.floor(pitchValue + 0.5)
+                yawValue = math.floor(yawValue + 0.5)
+            end
+
+            pcall(pitchRSC.setTargetSpeed, pitchValue)
+            pcall(yawRSC.setTargetSpeed, yawValue)
+        end
+
+        os.sleep(0.05)
+    end
+
+    stopRSCs(pitchRSC, yawRSC)
+    os.sleep(0.2)
+end
+
+local function findField(config, fieldName)
+    local pattern = fieldName .. "%s*=%s*([%+%-]?[%d%.]+)"
+    local value = config:match(pattern)
+
+    if not value then
+        error("Could not find " .. fieldName .. " in config.lua.")
+    end
+
+    return tonumber(value)
+end
+
+local function replaceField(config, fieldName, value)
+    local pattern = "(" .. fieldName .. "%s*=%s*)[%+%-]?[%d%.]+"
+
+    local updated, count = config:gsub(pattern, function(prefix)
+        return prefix .. formatNumber(value)
+    end, 1)
+
+    if count ~= 1 then
+        error("Could not update " .. fieldName .. ".")
+    end
+
+    return updated
+end
+
+local function average(values)
+    local total = 0
+    for _, value in ipairs(values) do
+        total = total + value
+    end
+
+    return total / #values
+end
+
+local function run()
+    local config = require("config")
+
+    local reader = findPeripheral(
+        config.peripheral.BLOCK_READER_TYPES,
+        "Block Reader"
+    )
+
+    local pitchRSC, yawRSC = findRSCs(config)
+
+    local pivot = config.cannon.world_pos
+    if not pivot then
+        error("c.cannon.world_pos is not set.")
+    end
+
+    local distance = POINT_DISTANCE
+    local targets = {
+        {
+            name = "Ahead",
+            x = pivot.x,
+            y = pivot.y,
+            z = pivot.z + distance,
+        },
+        {
+            name = "Right",
+            x = pivot.x + distance,
+            y = pivot.y,
+            z = pivot.z,
+        },
+        {
+            name = "Behind",
+            x = pivot.x,
+            y = pivot.y,
+            z = pivot.z - distance,
+        },
+        {
+            name = "Left",
+            x = pivot.x - distance,
+            y = pivot.y,
+            z = pivot.z,
+        },
+        {
+            name = "Ahead, 30 degrees up",
+            x = pivot.x,
+            y = pivot.y + distance * math.sin(math.rad(30)),
+            z = pivot.z + distance * math.cos(math.rad(30)),
+        },
+        {
+            name = "Right, 60 degrees up",
+            x = pivot.x + distance * math.cos(math.rad(60)),
+            y = pivot.y + distance * math.sin(math.rad(60)),
+            z = pivot.z,
+        },
+        {
+            name = "Behind, 30 degrees up",
+            x = pivot.x,
+            y = pivot.y + distance * math.sin(math.rad(30)),
+            z = pivot.z - distance * math.cos(math.rad(30)),
+        },
+    }
+
+    local yawOffsets = {}
+    local pitchOffsets = {}
+
+    stopRSCs(pitchRSC, yawRSC)
+
+    for index, target in ipairs(targets) do
+        local targetPitch, targetYaw = getTargetAngles(config, target)
+
+        if not targetPitch then
+            print("Skipping " .. target.name .. ": " .. targetYaw)
+        else
+            print("")
+            print("Point " .. index .. "/7: " .. target.name)
+            print("Target: " .. formatNumber(target.x) .. ", "
+                .. formatNumber(target.y) .. ", " .. formatNumber(target.z))
+            print("Requested: pitch " .. formatNumber(targetPitch)
+                .. ", yaw " .. formatNumber(targetYaw))
+            print("Aiming for " .. AIM_TIME .. " seconds...")
+
+            commandRSCs(
+                pitchRSC,
+                yawRSC,
+                config,
+                reader,
+                targetPitch,
+                targetYaw
+            )
+
+            local cannonPitch, cannonYaw = getBlockData(reader)
+
+            local yawOffset = wrapAngle(
+                cannonYaw - config.cannon.yaw_sign * targetYaw
+            )
+            local pitchOffset = wrapAngle(
+                cannonPitch - config.cannon.pitch_sign * targetPitch
+            )
+
+            yawOffsets[#yawOffsets + 1] = yawOffset
+            pitchOffsets[#pitchOffsets + 1] = pitchOffset
+
+            print("Measured yaw offset: " .. formatNumber(yawOffset))
+            print("Measured pitch offset: " .. formatNumber(pitchOffset))
+        end
+    end
+
+    if #yawOffsets == 0 or #pitchOffsets == 0 then
+        error("No calibration points could be measured.")
+    end
+
+    local averageYaw = average(yawOffsets)
+    local averagePitch = average(pitchOffsets)
+
+    print("")
+    print("Calibration complete.")
+    print("Average yaw offset: " .. formatNumber(averageYaw))
+    print("Average pitch offset: " .. formatNumber(averagePitch))
+    print("Measured points: " .. #yawOffsets .. "/7")
+
+    write("Save these offsets to config? [y/N]: ")
+    local answer = read()
+
+    if answer ~= "y" and answer ~= "Y" then
+        print("Cancelled. Config was not changed.")
+        return
+    end
+
+    local configText = readFile(CONFIG_FILE)
+    local updated = replaceField(configText, "yaw_offset_deg", averageYaw)
+    updated = replaceField(updated, "pitch_offset_deg", averagePitch)
+
+    writeFile(CONFIG_FILE .. ".bak", configText)
+    writeFile(CONFIG_FILE, updated)
+
+    print("Saved. Backup: " .. CONFIG_FILE .. ".bak")
+    print("Restart main to use the new offsets.")
+end
+
+local ok, err = pcall(run)
+
+local pitchRSC = peripheral.find("Create_RotationSpeedController")
+local yawRSC = peripheral.find("Create_RotationSpeedController")
+
+if pitchRSC then
+    pcall(pitchRSC.setTargetSpeed, 0)
+end
+
+if yawRSC then
+    pcall(yawRSC.setTargetSpeed, 0)
+end
+
+if not ok then
+    print("ERROR: " .. tostring(err))
+end

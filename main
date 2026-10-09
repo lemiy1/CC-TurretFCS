@@ -1,0 +1,509 @@
+-- main.lua
+-- CC:FCS controller, Player Detector edition.
+-- Usage:   main                   -> targets from config.target.names
+--          main nick1 nick2 ...   -> override the target list from the command line
+-- There is NO firing code in this project: the program only aims.
+
+local cli_args = { ... }
+
+term.clear()
+term.setCursorPos(1, 1)
+print("CC:FCS CONTROLLER BOOT:")
+
+-- IMPORTS
+local u    = require("math_utils_v6")
+local vec3 = u.Vector3
+
+local c             = require("config")
+local solver_module = require("intercept_solver")
+local tracker_lib   = require("target_tracker")
+
+-- HELPERS
+local function finite(x)
+    return type(x) == "number" and x == x and x > -1e9 and x < 1e9
+end
+
+local function fnum(x, d)
+    if type(x) ~= "number" or x ~= x then return "--" end
+    return string.format("%." .. (d or 2) .. "f", x)
+end
+
+-- CONFIG-DERIVED DATA
+local names = c.target.names
+if #cli_args > 0 then names = cli_args end
+if type(names) ~= "table" or #names == 0 then
+    error("No target names: set config.target.names or pass names as arguments", 0)
+end
+
+local cannon_world = nil
+do
+    local w = c.cannon.world_pos
+    if type(w) == "table" and finite(w.x) and finite(w.y) and finite(w.z) then
+        cannon_world = vec3.new(w.x, w.y, w.z)
+    end
+end
+
+-- PERIPHERAL WRAPPING
+local function find_first(types)
+    for _, t in ipairs(types) do
+        local p = peripheral.find(t)
+        if p then return p, t end
+    end
+    return nil
+end
+
+local reader = find_first(c.peripheral.BLOCK_READER_TYPES)
+    or error("Block reader not attached (tried: " .. table.concat(c.peripheral.BLOCK_READER_TYPES, ", ") .. ")", 0)
+
+local detector = peripheral.find(c.peripheral.PLAYER_DETECTOR_TYPE)
+    or error("Player detector not attached (type '" .. c.peripheral.PLAYER_DETECTOR_TYPE .. "')", 0)
+
+local function get_rscs()
+    local pn, yn = c.peripheral.PITCH_RSC_NAME, c.peripheral.YAW_RSC_NAME
+    if pn and yn then
+        local p, y = peripheral.wrap(pn), peripheral.wrap(yn)
+        if not p then error("Pitch RSC not found: " .. pn, 0) end
+        if not y then error("Yaw RSC not found: " .. yn, 0) end
+        return p, y
+    end
+    local tbl = { peripheral.find(c.peripheral.RSC_TYPE) }
+    if #tbl ~= 2 then error("Invalid number of speed controllers attached (must be 2, found " .. #tbl .. ")", 0) end
+    return tbl[c.peripheral.PITCH_RSC_INDEX], tbl[c.peripheral.YAW_RSC_INDEX]
+end
+
+local pitch_dev, yaw_dev = get_rscs()
+local RSCs = { pitch = {}, yaw = {} }
+RSCs.pitch.rsc  = pitch_dev
+RSCs.yaw.rsc    = yaw_dev
+RSCs.pitch.sign = c.peripheral.PITCH_RSC_SIGN
+RSCs.yaw.sign   = c.peripheral.YAW_RSC_SIGN
+
+-- screen (computer terminal or monitor)
+local screen = term.current()
+if c.diag.monitor then
+    local mon = peripheral.wrap(c.diag.monitor)
+    if mon then
+        mon.setTextScale(c.diag.monitor_scale or 0.5)
+        screen = mon
+    end
+end
+
+local manager = tracker_lib.new(c.target, names, cannon_world, c.cannon.dimension)
+
+-- STATE
+local state = {
+    cmd_log = {
+        { pitch = 0, yaw = 0 }, -- RPM sitting in RSC
+        { pitch = 0, yaw = 0 }, -- RPM executing at cannon
+    }
+}
+
+local cannon_pitch, cannon_yaw = 0, 0
+local cannon_valid       = false
+local cannon_read_time   = nil
+local cannon_status      = "no reading yet"
+
+local req_pitch, req_yaw = 0, 0
+local req_valid          = false
+local rsc_pitch, rsc_yaw = 0, 0
+local rsc_error          = nil
+
+local motors_enabled = c.diag.drive_motors and true or false
+local calib_request  = false
+local calib_msg      = nil
+local meas           = { reader_dt = nil, det_dt = nil }
+
+local L, W, H = {}, 51, 19
+
+local D_READ = c.controller.D_READ
+local req_history = {}
+for i = 1, D_READ + 1 do
+    req_history[i] = { pitch = 0, yaw = 0, valid = false }
+end
+
+-- RSC OUTPUT HELPERS
+local function safe_set(rsc, value)
+    local ok, err = pcall(rsc.setTargetSpeed, value)
+    if not ok then rsc_error = tostring(err) end
+    return ok
+end
+
+local function out_rpm(v)
+    if c.controller.ROUND_RPM then return math.floor(v + 0.5) end
+    return v
+end
+
+-- make sure nothing is spinning from a previous run
+safe_set(RSCs.pitch.rsc, 0)
+safe_set(RSCs.yaw.rsc, 0)
+
+-- updates log of intercept angles
+local function update_req_history()
+    table.insert(req_history, 1, { pitch = req_pitch, yaw = req_yaw, valid = req_valid })
+    req_history[D_READ + 2] = nil
+end
+
+-- cannon angle error against the request issued D_READ iterations ago (nil if unknown)
+local function cannon_error()
+    local past = req_history[D_READ + 1]
+    if not (past and past.valid and cannon_valid) then return nil end
+    return u.wrap_angle_deg(past.pitch - cannon_pitch), u.wrap_angle_deg(past.yaw - cannon_yaw)
+end
+
+local function cannon_ready(now)
+    if not cannon_valid then return false, cannon_status end
+    local age = now - cannon_read_time
+    if age > c.controller.CANNON_STALE_S then
+        return false, string.format("stale (%.2fs)", age)
+    end
+    return true
+end
+
+-- reads cannon mount pitch and yaw
+local function update_cannon_data()
+    while true do
+        local t0 = os.clock()
+        local ok, data = pcall(reader.getBlockData)
+        local now = os.clock()
+        meas.reader_dt = now - t0
+
+        if not ok then
+            cannon_valid  = false
+            cannon_status = "reader error: " .. tostring(data)
+        elseif type(data) ~= "table" then
+            cannon_valid  = false
+            cannon_status = "reader returned nil (not facing the cannon mount?)"
+        elseif not (finite(data.CannonPitch) and finite(data.CannonYaw)) then
+            local keys_list = {}
+            for k in pairs(data) do keys_list[#keys_list + 1] = tostring(k) end
+            table.sort(keys_list)
+            cannon_valid  = false
+            cannon_status = "no CannonPitch/CannonYaw; keys: " .. table.concat(keys_list, ",", 1, math.min(#keys_list, 8))
+        else
+            cannon_pitch     = u.wrap_angle_deg(data.CannonPitch)
+            cannon_yaw       = u.wrap_angle_deg(data.CannonYaw)
+            cannon_read_time = now
+            cannon_valid     = true
+            cannon_status    = "ok"
+        end
+
+        -- guarantee a yield even if the peripheral call did not take game time
+        if os.clock() == t0 then os.sleep(0) end
+    end
+end
+
+-- polls the Player Detector for every selected player
+local function poll_targets()
+    local det   = detector
+    local fails = 0
+    while true do
+        local t_cycle = os.clock()
+        for _, name in ipairs(names) do
+                        local ok, res
+	    -- New
+            if c.target.pos1 and c.target.pos2 then
+                local inArea, areaResult = pcall(
+                    det.isPlayerInCoords,
+                    c.target.pos1,
+                    c.target.pos2,
+                    name
+                )
+
+                if not inArea then
+                    ok, res = false, areaResult
+                elseif areaResult then
+                    ok, res = pcall(det.getPlayer, name)
+                else
+                    ok, res = true, nil
+                end
+            else
+                ok, res = pcall(det.getPlayer, name)
+            end
+
+
+            local now = os.clock()
+            if ok then
+                fails = 0
+                manager:ingest(name, res, now, nil)
+            else
+                fails = fails + 1
+                manager:ingest(name, nil, now, res)
+            end
+        end
+        meas.det_dt = os.clock() - t_cycle
+
+        if fails >= 20 then
+            det   = peripheral.find(c.peripheral.PLAYER_DETECTOR_TYPE) or det
+            fails = 0
+        end
+
+        if c.target.poll_sleep > 0 then
+            os.sleep(c.target.poll_sleep)
+        elseif os.clock() == t_cycle then
+            os.sleep(0)
+        end
+    end
+end
+
+-- finds where the cannon will be when the new command begins executing
+local function reconstruct_mid_state(cp, cy)
+    local function rsc_rpm_to_deg_per_tick(rsc_rpm)
+        return (rsc_rpm / c.controller.RSC_TO_CANNON) * 6 * c.controller.DT
+    end
+
+    local mid_pitch = cp
+        + rsc_rpm_to_deg_per_tick(state.cmd_log[2].pitch)
+        + rsc_rpm_to_deg_per_tick(state.cmd_log[1].pitch)
+
+    local mid_yaw = cy
+        + rsc_rpm_to_deg_per_tick(state.cmd_log[2].yaw)
+        + rsc_rpm_to_deg_per_tick(state.cmd_log[1].yaw)
+
+    return mid_pitch, mid_yaw
+end
+
+-- finds RSC RPM that closes the delta between midstate angles and required angles in one tick
+local function backsolve_rsc(mid_pitch, mid_yaw, rq_pitch, rq_yaw)
+    local function deg_per_tick_to_rsc_rpm(delta_deg)
+        return (delta_deg / c.controller.DT) / 6 * c.controller.RSC_TO_CANNON
+    end
+
+    local delta_p = u.wrap_angle_deg(rq_pitch - mid_pitch)
+    local delta_y = u.wrap_angle_deg(rq_yaw   - mid_yaw)
+
+    local p = deg_per_tick_to_rsc_rpm(delta_p)
+    local y = deg_per_tick_to_rsc_rpm(delta_y)
+
+    p = u.clamp(p, -c.controller.MAX_RSC_RPM, c.controller.MAX_RSC_RPM)
+    y = u.clamp(y, -c.controller.MAX_RSC_RPM, c.controller.MAX_RSC_RPM)
+
+    return p, y
+end
+
+-- RSC output.
+-- The values are captured BEFORE the (yielding) peripheral calls, so the log contains exactly what was sent
+-- (in the original the log was read after the yield and could already hold the next command).
+local function write_and_log()
+    while true do
+        local t0 = os.clock()
+        local p, y = rsc_pitch, rsc_yaw
+        parallel.waitForAll(
+            function() safe_set(RSCs.pitch.rsc, out_rpm(p) * RSCs.pitch.sign) end,
+            function() safe_set(RSCs.yaw.rsc,   out_rpm(y) * RSCs.yaw.sign)   end
+        )
+        state.cmd_log[2] = state.cmd_log[1]
+        state.cmd_log[1] = { pitch = p, yaw = y }
+        if os.clock() == t0 then os.sleep(0) end
+    end
+end
+
+-- keyboard: M = motors on/off, C = calibration hint
+local function key_listener()
+    while true do
+        local _, key = os.pullEvent("key")
+        if key == keys.m and c.diag.allow_key_toggle then
+            motors_enabled = not motors_enabled
+        elseif key == keys.c then
+            calib_request = true
+        end
+    end
+end
+
+-- SCREEN
+local function add(s)
+    s = tostring(s)
+    while #s > W do
+        L[#L + 1] = string.sub(s, 1, W)
+        s = "  " .. string.sub(s, W + 1)
+    end
+    L[#L + 1] = s
+end
+
+local function draw()
+    for i = 1, H do
+        screen.setCursorPos(1, i)
+        screen.clearLine()
+        local s = L[i]
+        if s then screen.write(string.sub(s, 1, W)) end
+    end
+end
+
+-- main
+local function main()
+    os.sleep(0.1)
+    local solver     = solver_module.new(c.solver)
+    local t_pipeline = (c.controller.D_TOTAL + c.controller.D_TARGET_ALIGNMENT) * c.controller.DT
+    local cf         = c.cannon
+    local count      = 0
+    local cur_name, cur_epoch, last_key = nil, nil, nil
+
+    while true do
+        os.sleep(0)
+        count = count + 1
+        local now = os.clock()
+        W, H = screen.getSize()
+        L = {}
+
+        update_req_history()
+
+        local active, why     = false, nil
+        local sel             = nil
+        local limit_flag      = false
+        local cannon_ok, cannon_why = cannon_ready(now)
+
+        if not cannon_world then
+            why = "config.cannon.world_pos is not set"
+        elseif not cannon_ok then
+            why = "cannon angles: " .. tostring(cannon_why)
+        else
+            sel, why = manager:select(now)
+        end
+
+        if sel then
+            local rel = sel.pos - cannon_world
+            if cur_name ~= sel.name or cur_epoch ~= sel.epoch then
+                solver:reset()
+                cur_name, cur_epoch, last_key = sel.name, sel.epoch, nil
+            end
+            local key = sel.name .. "#" .. sel.epoch .. "#" .. sel.seq
+            local td  = { pos = rel, velo = sel.velo, read_time = sel.read_time }
+
+            local ok, p, y = pcall(solver.solve, solver, td, t_pipeline, key == last_key)
+            if ok and finite(p) and finite(y) then
+                last_key  = key
+                limit_flag = p <= c.solver.sys.min_pitch + 1e-6
+                req_pitch = cf.pitch_sign * p + cf.pitch_offset_deg
+                req_yaw   = u.wrap_angle_deg(cf.yaw_sign * y + cf.yaw_offset_deg)
+                active    = true
+            else
+                why = ok and "solver returned invalid angles" or ("solver error: " .. tostring(p))
+                solver:reset()
+                cur_name, last_key = nil, nil
+            end
+        else
+            cur_name, last_key = nil, nil
+        end
+
+        -- RSC command (backsolve logic unchanged)
+        local calc_p, calc_y = nil, nil
+        if active then
+            local mid_pitch, mid_yaw = cannon_pitch, cannon_yaw
+            calc_p, calc_y = backsolve_rsc(mid_pitch, mid_yaw, req_pitch, req_yaw)
+        end
+        if active and motors_enabled then
+            rsc_pitch, rsc_yaw = calc_p, calc_y
+        else
+            rsc_pitch, rsc_yaw = 0, 0
+        end
+        req_valid = active
+
+        -- DIAGNOSTICS DATA
+        local tr = (sel and manager.tracks[sel.name]) or manager.tracks[names[1]]
+        local hl = tr.hist[#tr.hist]
+        local est, est_why = tr:estimate(now)
+
+        local rel_d, los_p, los_y
+        if hl and cannon_world then
+            rel_d = vec3.new(hl.x - cannon_world.x, hl.y - cannon_world.y, hl.z - cannon_world.z)
+            if rel_d:length() > 1e-6 then
+                local lp, ly = rel_d:aimAt()
+                los_p, los_y = u.toDeg(lp), u.toDeg(ly)
+            end
+        end
+
+        if calib_request then
+            calib_request = false
+            if los_y and cannon_valid then
+                calib_msg = string.format(
+                    "CALIB: yaw_offset_deg=%s pitch_offset_deg=%s (barrel must point AT the target)",
+                    fnum(u.wrap_angle_deg(cannon_yaw   - cf.yaw_sign   * los_y), 1),
+                    fnum(u.wrap_angle_deg(cannon_pitch - cf.pitch_sign * los_p), 1))
+            else
+                calib_msg = "CALIB: need target position and cannon angles"
+            end
+        end
+
+        -- RENDER
+        add(string.format("CC:FCS %s  #%d", motors_enabled and "MOTORS ON" or "DRY-RUN (RSC=0)", count))
+        if active then
+            add("STATE: TRACKING")
+        else
+            add("STATE: INACTIVE - " .. tostring(why))
+        end
+
+        add(string.format("target: %s  dim: %s", tr.name, tostring(tr.dim or "?")))
+        add("detector: " .. tostring(tr.status))
+        if #names > 1 then
+            for i = 1, math.min(#names, 3) do
+                add(string.format(" %s: %s", names[i], tostring(manager.reasons[names[i]] or "?")))
+            end
+            if #names > 3 then add(" (+" .. (#names - 3) .. " more)") end
+        end
+
+        if hl then
+            add(string.format("world(+off): %s %s %s", fnum(hl.x, 1), fnum(hl.y, 1), fnum(hl.z, 1)))
+            if rel_d then
+                add(string.format("rel: %s %s %s  dist %s",
+                    fnum(rel_d.x, 1), fnum(rel_d.y, 1), fnum(rel_d.z, 1), fnum(rel_d:length(), 1)))
+            end
+            add(string.format("age %ss  dt %ss  n=%s  span %ss",
+                fnum(now - hl.t, 2), fnum(tr.last_dt, 2), tostring(#tr.hist),
+                fnum(hl.t - tr.hist[1].t, 2)))
+        else
+            add("no samples yet")
+        end
+
+        if est then
+            add(string.format("velo b/s: %s %s %s  |v| %s",
+                fnum(est.velo.x, 1), fnum(est.velo.y, 1), fnum(est.velo.z, 1), fnum(est.speed, 1)))
+        else
+            add("velo: n/a (" .. tostring(est_why) .. ")")
+        end
+
+        add(string.format("LOS  yaw %s  pitch %s", fnum(los_y, 1), fnum(los_p, 1)))
+        add(string.format("REQ  yaw %s  pitch %s", active and fnum(req_yaw, 1) or "--", active and fnum(req_pitch, 1) or "--"))
+        add(string.format("CAN  yaw %s  pitch %s  [%s]", fnum(cannon_yaw, 1), fnum(cannon_pitch, 1), cannon_valid and "ok" or "no data"))
+
+        local ep, ey = cannon_error()
+        add(string.format("ERR  yaw %s  pitch %s", fnum(ey, 2), fnum(ep, 2)))
+        add(string.format("RSC rpm calc p %s y %s | out p %s y %s",
+            fnum(calc_p, 1), fnum(calc_y, 1), fnum(rsc_pitch, 1), fnum(rsc_yaw, 1)))
+
+        if active then
+            add(string.format("miss %s blk  tgo %s s", fnum(solver.intercept.miss_dist, 2), fnum(solver.intercept.time, 2)))
+        end
+
+        local warns = {}
+        if tr.int_run >= 8 then warns[#warns + 1] = "coords are integers (+-1 blk)" end
+        if limit_flag then warns[#warns + 1] = "pitch at min_pitch limit" end
+        if active and solver.intercept.miss_dist > c.diag.miss_warn then warns[#warns + 1] = "large miss: unreachable?" end
+        if meas.reader_dt then
+            local ticks = math.floor(meas.reader_dt / c.controller.DT + 0.5)
+            if ticks ~= D_READ then
+                warns[#warns + 1] = string.format("reader call=%d tick(s), D_READ=%d", ticks, D_READ)
+            end
+        end
+        if tr.reset_note then warns[#warns + 1] = "reset: " .. tr.reset_note end
+        if rsc_error then warns[#warns + 1] = "RSC: " .. rsc_error end
+        if #warns > 0 then add("WARN: " .. table.concat(warns, "; ")) end
+
+        if calib_msg then add(calib_msg) end
+        add(c.diag.allow_key_toggle and "keys: [M] motors on/off  [C] calibration hint" or "keys: [C] calibration hint")
+
+        draw()
+    end
+end
+
+-- parallel call synchronises everything; fail-safe stop of both RSCs on any exit or error
+local ok, err = pcall(parallel.waitForAny,
+    update_cannon_data,
+    poll_targets,
+    main,
+    write_and_log,
+    key_listener
+)
+
+safe_set(RSCs.pitch.rsc, 0)
+safe_set(RSCs.yaw.rsc, 0)
+
+if not ok then error(err, 0) end

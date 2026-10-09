@@ -1,0 +1,201 @@
+-- 4zones.lua
+-- Edit the player detection area (pos1 and pos2) in config.lua.
+
+local scriptPath = shell.getRunningProgram()
+local scriptDir = fs.getDir(scriptPath)
+local CONFIG_FILE = fs.combine(scriptDir, "config")
+
+local function readFile(path)
+    if not fs.exists(path) then
+        error("File not found: " .. path)
+    end
+
+    local file = fs.open(path, "r")
+    if not file then
+        error("Could not open: " .. path)
+    end
+
+    local text = file.readAll()
+    file.close()
+    return text
+end
+
+local function writeFile(path, text)
+    local file = fs.open(path, "w")
+    if not file then
+        error("Could not write: " .. path)
+    end
+
+    file.write(text)
+    file.close()
+end
+
+local function formatNumber(value)
+    return string.format("%.6f", value):gsub("0+$", ""):gsub("%.$", "")
+end
+
+local function askNumber(label, oldValue)
+    while true do
+        write(label .. " [" .. tostring(oldValue) .. "]: ")
+        local input = read()
+
+        if input == "" then
+            return oldValue
+        end
+
+        local value = tonumber(input)
+        if value then
+            return value
+        end
+
+        print("Enter a number, or press Enter to keep the current value.")
+    end
+end
+
+local function findMatchingBrace(text, openBrace)
+    local depth = 0
+
+    for position = openBrace, #text do
+        local character = text:sub(position, position)
+
+        if character == "{" then
+            depth = depth + 1
+        elseif character == "}" then
+            depth = depth - 1
+
+            if depth == 0 then
+                return position
+            end
+        end
+    end
+
+    return nil
+end
+
+local function findTargetTable(config)
+    local start, openBrace = config:find("c%.target%s*=%s*{")
+    if not start then
+        error("Could not find c.target table in config.lua.")
+    end
+
+    local closeBrace = findMatchingBrace(config, openBrace)
+    if not closeBrace then
+        error("Could not find the closing brace for c.target.")
+    end
+
+    return start, openBrace, closeBrace
+end
+
+local function findPosition(config, label, searchStart, searchEnd)
+    local pattern = label .. "%s*=%s*{"
+    local start, openBrace = config:find(pattern, searchStart)
+
+    if not start or start > searchEnd then
+        error("Could not find " .. label .. " inside c.target.")
+    end
+
+    local closeBrace = findMatchingBrace(config, openBrace)
+    if not closeBrace or closeBrace > searchEnd then
+        error("Could not find the closing brace for " .. label .. ".")
+    end
+
+    local block = config:sub(openBrace + 1, closeBrace - 1)
+    local x = block:match("x%s*=%s*([%+%-]?[%d%.]+)")
+    local y = block:match("y%s*=%s*([%+%-]?[%d%.]+)")
+    local z = block:match("z%s*=%s*([%+%-]?[%d%.]+)")
+
+    if not (x and y and z) then
+        error("Could not read x, y or z in " .. label .. ".")
+    end
+
+    return {
+        start = start,
+        close = closeBrace,
+        x = tonumber(x),
+        y = tonumber(y),
+        z = tonumber(z),
+    }
+end
+
+local function replacePosition(config, position, label, x, y, z)
+    local replacement = label .. " = { x = " .. formatNumber(x)
+        .. ", y = " .. formatNumber(y)
+        .. ", z = " .. formatNumber(z) .. " }"
+
+    return config:sub(1, position.start - 1)
+        .. replacement
+        .. config:sub(position.close + 1)
+end
+
+local function showArea(pos1, pos2)
+    print("")
+    print("Current detection area:")
+    print("  pos1: " .. formatNumber(pos1.x) .. ", "
+        .. formatNumber(pos1.y) .. ", " .. formatNumber(pos1.z))
+    print("  pos2: " .. formatNumber(pos2.x) .. ", "
+        .. formatNumber(pos2.y) .. ", " .. formatNumber(pos2.z))
+    print("")
+end
+
+local function run()
+    local config = readFile(CONFIG_FILE)
+
+    local targetStart, targetOpen, targetClose = findTargetTable(config)
+    local pos1 = findPosition(config, "pos1", targetOpen, targetClose)
+    local pos2 = findPosition(config, "pos2", targetOpen, targetClose)
+
+    if pos1.start <= targetStart or pos1.close >= targetClose then
+        error("pos1 was found outside c.target. Config was not changed.")
+    end
+
+    if pos2.start <= targetStart or pos2.close >= targetClose then
+        error("pos2 was found outside c.target. Config was not changed.")
+    end
+
+    showArea(pos1, pos2)
+
+    print("Enter the first corner of the detection area.")
+    print("Press Enter to keep the current value.")
+    print("")
+
+    local x1 = askNumber("pos1 X", pos1.x)
+    local y1 = askNumber("pos1 Y", pos1.y)
+    local z1 = askNumber("pos1 Z", pos1.z)
+
+    print("")
+    print("Enter the opposite corner of the detection area.")
+    print("")
+
+    local x2 = askNumber("pos2 X", pos2.x)
+    local y2 = askNumber("pos2 Y", pos2.y)
+    local z2 = askNumber("pos2 Z", pos2.z)
+
+    if x1 >= x2 or y1 >= y2 or z1 >= z2 then
+        print("")
+        print("WARNING: pos1 must be smaller than pos2 on every axis.")
+        print("The Player Detector area may be empty.")
+    end
+
+    local updated = replacePosition(config, pos1, "pos1", x1, y1, z1)
+    updated = replacePosition(updated, pos2, "pos2", x2, y2, z2)
+
+    print("")
+    write("Save changes to " .. CONFIG_FILE .. "? [y/N]: ")
+    local answer = read()
+
+    if answer ~= "y" and answer ~= "Y" then
+        print("Cancelled. Config was not changed.")
+        return
+    end
+
+    writeFile(CONFIG_FILE .. ".bak", config)
+    writeFile(CONFIG_FILE, updated)
+
+    print("Saved. Backup: " .. CONFIG_FILE .. ".bak")
+    print("Restart main to load the new detection area.")
+end
+
+local ok, err = pcall(run)
+if not ok then
+    print("ERROR: " .. tostring(err))
+end

@@ -1,0 +1,109 @@
+-- set_cannon.lua
+-- Edit cannon pivot coordinates in config.
+
+local scriptPath = shell.getRunningProgram()
+local scriptDir = fs.getDir(scriptPath)
+local CONFIG_FILE = fs.combine(scriptDir, "config")
+
+local function readFile(path)
+    if not fs.exists(path) then
+        error("File not found: " .. path)
+    end
+
+    local file = fs.open(path, "r")
+    if not file then
+        error("Cannot open " .. path)
+    end
+
+    local text = file.readAll()
+    file.close()
+    return text
+end
+
+local function writeFile(path, text)
+    local file = fs.open(path, "w")
+    if not file then
+        error("Cannot write " .. path)
+    end
+
+    file.write(text)
+    file.close()
+end
+
+local function askNumber(label, oldValue)
+    while true do
+        write(label .. " [" .. tostring(oldValue) .. "]: ")
+        local input = read()
+
+        if input == "" then
+            return oldValue
+        end
+
+        local value = tonumber(input)
+        if value then
+            return value
+        end
+
+        print("Enter a number, or press Enter to keep the current value.")
+    end
+end
+
+local function formatNumber(value)
+    return string.format("%.6f", value):gsub("0+$", ""):gsub("%.$", "")
+end
+
+local function run()
+    local config = readFile(CONFIG_FILE)
+
+    local oldX, oldY, oldZ = config:match(
+        "world_pos%s*=%s*{%s*x%s*=%s*([%+%-]?[%d%.]+)%s*,%s*y%s*=%s*([%+%-]?[%d%.]+)%s*,%s*z%s*=%s*([%+%-]?[%d%.]+)%s*}"
+    )
+
+    if not (oldX and oldY and oldZ) then
+        error("Could not find c.cannon.world_pos in config.")
+    end
+
+    oldX, oldY, oldZ = tonumber(oldX), tonumber(oldY), tonumber(oldZ)
+
+    print("Cannon pivot coordinates")
+    print("Press Enter to keep a value.")
+    print("")
+
+    local x = askNumber("X", oldX)
+    local y = askNumber("Y", oldY)
+    local z = askNumber("Z", oldZ)
+
+    local pattern =
+        "world_pos%s*=%s*{%s*x%s*=%s*[%+%-]?[%d%.]+%s*,%s*y%s*=%s*[%+%-]?[%d%.]+%s*,%s*z%s*=%s*[%+%-]?[%d%.]+%s*}"
+
+    local replacement = "world_pos        = { x = " .. formatNumber(x)
+        .. ", y = " .. formatNumber(y)
+        .. ", z = " .. formatNumber(z) .. " }"
+
+    local updated, count = config:gsub(pattern, replacement, 1)
+    if count ~= 1 then
+        error("Could not update world_pos. Config was not changed.")
+    end
+
+    print("")
+    print("New pivot: " .. formatNumber(x) .. ", "
+        .. formatNumber(y) .. ", " .. formatNumber(z))
+    write("Save to config? [y/N]: ")
+
+    local confirm = read()
+    if confirm ~= "y" and confirm ~= "Y" then
+        print("Cancelled.")
+        return
+    end
+
+    writeFile(CONFIG_FILE .. ".bak", config)
+    writeFile(CONFIG_FILE, updated)
+
+    print("Saved. Backup: config.bak")
+    print("Restart main to load the new coordinates.")
+end
+
+local ok, err = pcall(run)
+if not ok then
+    print("ERROR: " .. tostring(err))
+end
